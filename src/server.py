@@ -27,8 +27,8 @@ def main():
         id="",
         name="",
         description="",
-        tags=[""],
-        examples=[""]
+        tags=[],
+        examples=[]
     )
 
     agent_card = AgentCard(

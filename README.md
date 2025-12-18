@@ -57,3 +57,7 @@ ghcr.io/<your-username>/<your-repo-name>:latest
 ghcr.io/<your-username>/<your-repo-name>:1.0.0
 ghcr.io/<your-username>/<your-repo-name>:1
 ```
+
+Once the workflow completes, find your Docker image in the Packages section (right sidebar of your repository). Configure the package visibility in package settings.
+
+> **Note:** Organization repositories may need package write permissions enabled manually (Settings → Actions → General). Version tags must follow [semantic versioning](https://semver.org/) (e.g., `v1.0.0`).
