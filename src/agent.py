@@ -39,6 +39,35 @@ def _extract_label(model_output: str) -> Optional[str]:
     return None
 
 
+def _find_repo_root() -> Path:
+    """
+    Find the repository root by looking for marker files/directories.
+    
+    This is more robust than relying on __file__ location, especially
+    in different environments (local dev, Docker, tests).
+    """
+    # Start from current file location
+    current = Path(__file__).resolve().parent
+    
+    # Try going up from src/ directory
+    if current.name == "src":
+        repo_root = current.parent
+    else:
+        repo_root = current
+    
+    # Verify we found the right place by checking for expected directories
+    if (repo_root / "mutation_data").exists() and (repo_root / "prompts").exists():
+        return repo_root
+    
+    # If not found, try going up one more level (handles nested cases)
+    repo_root = repo_root.parent
+    if (repo_root / "mutation_data").exists() and (repo_root / "prompts").exists():
+        return repo_root
+    
+    # Last resort: use the parent of src/
+    return Path(__file__).resolve().parents[1]
+
+
 class Agent:
     # Single purple agent role
     required_roles: list[str] = ["agent"]
@@ -49,13 +78,26 @@ class Agent:
     def __init__(self):
         self.messenger = Messenger()
 
-        # Package these files inside your green agent repo image
-        self.repo_root = Path(__file__).resolve().parents[1]
+        # Robust path resolution
+        self.repo_root = _find_repo_root()
         self.default_dataset_path = self.repo_root / "mutation_data" / "mutated_dataset.csv"
         self.default_prompt_path = self.repo_root / "prompts" / "prompt_3letter_2shot_NOmultiple.txt"
 
+        # Debug output to help diagnose path issues
+        print(f"DEBUG: Repo root resolved to: {self.repo_root}")
+        print(f"DEBUG: Dataset path: {self.default_dataset_path}")
+        print(f"DEBUG: Dataset exists: {self.default_dataset_path.exists()}")
+        if self.default_dataset_path.exists():
+            with open(self.default_dataset_path, 'r', encoding='utf-8') as f:
+                line_count = sum(1 for _ in f) - 1  # -1 for header
+                print(f"DEBUG: Dataset has {line_count} data rows")
+
         # Load single prompt at startup
-        self.prompt = self.default_prompt_path.read_text(encoding="utf-8")
+        if self.default_prompt_path.exists():
+            self.prompt = self.default_prompt_path.read_text(encoding="utf-8")
+        else:
+            print(f"WARNING: Prompt file not found at {self.default_prompt_path}")
+            self.prompt = "Classify the following openHAB rules for RIT threats:"
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         missing_roles = set(self.required_roles) - set(request.participants.keys())
@@ -85,7 +127,7 @@ class Agent:
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         # Reset messenger state for isolation
         self.messenger.reset()
-
+        
         input_text = get_message_text(message)
 
         try:
@@ -107,6 +149,13 @@ class Agent:
         gold_col = cfg.get("gold_column", "trad_result")
         max_rows = int(cfg.get("max_rows", 50))
 
+        # Verify dataset exists
+        if not dataset_path.exists():
+            await updater.failed(
+                new_agent_text_message(f"Dataset not found: {dataset_path}")
+            )
+            return
+
         await updater.update_status(
             TaskState.working,
             new_agent_text_message(
@@ -122,43 +171,49 @@ class Agent:
         # Keep a small sample of row-level details for debugging
         row_samples: list[dict[str, Any]] = []
 
-        with dataset_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for i, row in enumerate(reader):
-                if i >= max_rows:
-                    break
+        try:
+            with dataset_path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for i, row in enumerate(reader):
+                    if i >= max_rows:
+                        break
 
-                ruleset_text = row.get(ruleset_col, "")
-                gold = (row.get(gold_col, "") or "").strip().upper()
+                    ruleset_text = row.get(ruleset_col, "")
+                    gold = (row.get(gold_col, "") or "").strip().upper()
 
-                # Single call to purple agent
-                purple_response = await self._ask_purple(purple_url, ruleset_text)
-                pred = _extract_label(purple_response)
+                    # Single call to purple agent
+                    purple_response = await self._ask_purple(purple_url, ruleset_text)
+                    pred = _extract_label(purple_response)
 
-                total += 1
-                if pred:
-                    per_label[pred] += 1
-                if pred == gold:
-                    correct += 1
+                    total += 1
                     if pred:
-                        per_label_correct[pred] += 1
+                        per_label[pred] += 1
+                    if pred == gold:
+                        correct += 1
+                        if pred:
+                            per_label_correct[pred] += 1
 
-                # Keep only a few sample rows to avoid huge artifacts
-                if len(row_samples) < 20:
-                    row_samples.append(
-                        {
-                            "row_index": i,
-                            "gold": gold,
-                            "pred": pred,
-                            "purple_response_preview": purple_response[:200],
-                        }
-                    )
+                    # Keep only a few sample rows to avoid huge artifacts
+                    if len(row_samples) < 20:
+                        row_samples.append(
+                            {
+                                "row_index": i,
+                                "gold": gold,
+                                "pred": pred,
+                                "purple_response_preview": purple_response[:200],
+                            }
+                        )
 
-                if total % 10 == 0:
-                    await updater.update_status(
-                        TaskState.working,
-                        new_agent_text_message(f"Progress: {total} rows evaluated..."),
-                    )
+                    if total % 10 == 0:
+                        await updater.update_status(
+                            TaskState.working,
+                            new_agent_text_message(f"Progress: {total} rows evaluated..."),
+                        )
+        except Exception as e:
+            await updater.failed(
+                new_agent_text_message(f"Error reading dataset: {e}")
+            )
+            return
 
         accuracy = (correct / total) if total else 0.0
 
@@ -182,7 +237,7 @@ class Agent:
             },
         }
 
-        print(f"DEBUG: About to create artifact. Accuracy: {accuracy}, Total: {total}")
+        print(f"DEBUG: About to create artifact. Accuracy: {accuracy:.4f}, Total: {total}")
 
         await updater.add_artifact(
             parts=[
@@ -193,7 +248,6 @@ class Agent:
         )
 
         print(f"DEBUG: Artifact created successfully")
-        print(f"DEBUG: Terminal state reached: {updater._terminal_state_reached}")
 
         await updater.update_status(
             TaskState.completed, new_agent_text_message("Done.")
