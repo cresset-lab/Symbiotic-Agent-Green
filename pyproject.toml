@@ -23,3 +23,9 @@ dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "ci: Fast A2A conformance tests (required for CI)",
+    "functional: End-to-end functional tests (run locally)",
+]

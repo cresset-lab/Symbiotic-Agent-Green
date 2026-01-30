@@ -160,6 +160,7 @@ async def send_text_message(text: str, url: str, context_id: str | None = None, 
 
 # A2A conformance tests
 
+@pytest.mark.ci
 def test_agent_card(agent):
     """Validate agent card structure and required fields."""
     response = httpx.get(f"{agent}/.well-known/agent-card.json")
