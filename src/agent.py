@@ -24,10 +24,6 @@ class EvalRequest(BaseModel):
 ALLOWED_LABELS = {"WAC", "SAC", "WTC", "STC", "WCC", "SCC"}
 
 
-def _load_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
 def _extract_label(model_output: str) -> Optional[str]:
     """
     Robust parsing: accept exactly one of the allowed 3-letter labels
@@ -43,65 +39,23 @@ def _extract_label(model_output: str) -> Optional[str]:
     return None
 
 
-def _vote(labels: list[Optional[str]]) -> tuple[Optional[str], dict[str, Any]]:
-    """
-    Majority vote.
-    Deterministic tie-break for 1–1–1:
-      prefer 2-shot, then 1-shot, then 0-shot (i.e., last -> first).
-    """
-    clean = [x for x in labels if x in ALLOWED_LABELS]
-    meta: dict[str, Any] = {"raw_labels": labels, "valid_labels": clean}
-
-    if not clean:
-        meta["decision"] = "no_valid_votes"
-        return None, meta
-
-    counts = Counter(clean)
-    top_label, top_n = counts.most_common(1)[0]
-    if top_n >= 2:
-        meta["decision"] = "majority"
-        meta["counts"] = dict(counts)
-        return top_label, meta
-
-    # 1–1–1 (or all distinct) -> deterministic tie-break: 2-shot > 1-shot > 0-shot
-    for preferred in [labels[2], labels[1], labels[0]]:
-        if preferred in ALLOWED_LABELS:
-            meta["decision"] = "tie_break_prefer_more_shots"
-            meta["counts"] = dict(counts)
-            return preferred, meta
-
-    meta["decision"] = "tie_break_failed"
-    meta["counts"] = dict(counts)
-    return None, meta
-
-
 class Agent:
     # Single purple agent role
     required_roles: list[str] = ["agent"]
 
-    # Keep config flexible; you can add required keys later if you want
+    # Keep config flexible
     required_config_keys: list[str] = []
 
     def __init__(self):
         self.messenger = Messenger()
 
-        # Package these files inside your green agent repo image.
-        # Example layout:
-        #   src/agent.py
-        #   data/mutated_dataset.csv
-        #   prompts/prompt_3letter_0shot_NOmultiple.txt
-        #   prompts/prompt_3letter_1shot_NOmultiple.txt
-        #   prompts/prompt_3letter_2shot_NOmultiple.txt
+        # Package these files inside your green agent repo image
         self.repo_root = Path(__file__).resolve().parents[1]
         self.default_dataset_path = self.repo_root / "mutation_data" / "mutated_dataset.csv"
-        self.default_prompt_paths = [
-            self.repo_root / "prompts" / "prompt_3letter_0shot_NOmultiple.txt",
-            self.repo_root / "prompts" / "prompt_3letter_1shot_NOmultiple.txt",
-            self.repo_root / "prompts" / "prompt_3letter_2shot_NOmultiple.txt",
-        ]
+        self.default_prompt_path = self.repo_root / "prompts" / "prompt_3letter_0shot_NOmultiple.txt"
 
-        # Load prompts at startup
-        self.prompts = [p.read_text(encoding="utf-8") for p in self.default_prompt_paths]
+        # Load single prompt at startup
+        self.prompt = self.default_prompt_path.read_text(encoding="utf-8")
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         missing_roles = set(self.required_roles) - set(request.participants.keys())
@@ -114,17 +68,18 @@ class Agent:
 
         return True, "ok"
 
-    async def _ask_purple(self, purple_url: str, prompt: str, ruleset_text: str) -> str:
+    async def _ask_purple(self, purple_url: str, ruleset_text: str) -> str:
         """
-        A2A call to the purple agent.
+        A2A call to the purple agent with prompt + ruleset.
+        Purple agent handles all voting/decision logic internally.
         """
         payload = (
-            f"{prompt}\n\n"
+            f"{self.prompt}\n\n"
             "===== INPUT START =====\n"
             f"{ruleset_text}\n"
             "===== INPUT END =====\n"
         )
-        response: str = await self.messenger.talk_to_agent(payload, purple_url)  # ← Just pass the string!
+        response: str = await self.messenger.talk_to_agent(payload, purple_url)
         return response
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
@@ -147,7 +102,7 @@ class Agent:
         dataset_path = Path(cfg.get("dataset_path", self.default_dataset_path))
         ruleset_col = cfg.get("ruleset_column", "ruleset")
         gold_col = cfg.get("gold_column", "trad_result")
-        max_rows = int(cfg.get("max_rows", 50))  # IMPORTANT: 3 calls per row can be expensive
+        max_rows = int(cfg.get("max_rows", 50))
 
         await updater.update_status(
             TaskState.working,
@@ -161,7 +116,7 @@ class Agent:
         per_label = Counter()
         per_label_correct = Counter()
 
-        # Optional: keep a small sample of row-level details for debugging
+        # Keep a small sample of row-level details for debugging
         row_samples: list[dict[str, Any]] = []
 
         with dataset_path.open("r", encoding="utf-8", newline="") as f:
@@ -173,15 +128,9 @@ class Agent:
                 ruleset_text = row.get(ruleset_col, "")
                 gold = (row.get(gold_col, "") or "").strip().upper()
 
-                # Never send gold/trad_result to purple!
-                outputs = []
-                labels = []
-                for prompt in self.prompts:
-                    out = await self._ask_purple(purple_url, prompt, ruleset_text)
-                    outputs.append(out)
-                    labels.append(_extract_label(out))
-
-                pred, meta = _vote(labels)
+                # Single call to purple agent
+                purple_response = await self._ask_purple(purple_url, ruleset_text)
+                pred = _extract_label(purple_response)
 
                 total += 1
                 if pred:
@@ -198,10 +147,7 @@ class Agent:
                             "row_index": i,
                             "gold": gold,
                             "pred": pred,
-                            "votes": labels,
-                            "decision": meta.get("decision"),
-                            # store short snippets only
-                            "purple_raw_outputs_preview": [o[:200] for o in outputs],
+                            "purple_response_preview": purple_response[:200],
                         }
                     )
 
@@ -230,11 +176,8 @@ class Agent:
                 "gold_column": gold_col,
                 "max_rows": max_rows,
                 "allowed_labels": sorted(ALLOWED_LABELS),
-                "tie_break": "prefer 2-shot > 1-shot > 0-shot",
             },
         }
-
-        print(f"DEBUG: About to create artifact. Accuracy: {accuracy}, Total: {total}")
 
         await updater.add_artifact(
             parts=[
@@ -243,9 +186,6 @@ class Agent:
             ],
             name="Result",
         )
-
-        print(f"DEBUG: Artifact created successfully")
-        print(f"DEBUG: Terminal state reached: {updater._terminal_state_reached}")
 
         await updater.update_status(
             TaskState.completed, new_agent_text_message("Done.")
