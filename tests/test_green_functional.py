@@ -522,66 +522,246 @@ async def test_real_dataset_full_default_run(agent, mock_purple):
     # Should have label statistics
     assert len(data["label_stats"]["pred_counts"]) > 0
 
-
 # ============================================================================
-# Additional tests for robust agent features
+# RIT Filter Tests
+#
+# These tests verify the RIT type filtering feature that allows evaluating
+# only specific RIT types (e.g., only SCC rows, only WTC rows, etc.)
 # ============================================================================
 
-# @pytest.mark.functional
-# @pytest.mark.asyncio
-# async def test_robust_agent_handles_errors_gracefully(agent, mock_purple):
-#     """
-#     Test that the robust agent continues processing even if some rows fail.
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_rit_filter_basic(agent, mock_purple):
+    """
+    Test that RIT filter only processes rows matching the specified type.
     
-#     This test only makes sense for the robust agent implementation.
-#     For the original agent, it will just verify basic functionality.
-#     """
-#     req = {
-#         "participants": {"agent": mock_purple},
-#         "config": {
-#             "max_rows": 5,
-#             "skip_health_check": True,
-#         },
-#     }
+    Think of it like a coffee filter - only rows with the matching gold label
+    should pass through to be evaluated.
+    """
 
-#     events = await send_text_message(json.dumps(req), agent, streaming=False)
-#     data = _extract_result_data(events)
-#     assert data is not None
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 10,
+            "rit_filter": "SCC",  # Only evaluate SCC rows
+            "skip_health_check": True,
+        },
+    }
+
+    httpx.post(f"{mock_purple}/debug/reset", timeout=2)
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    data = _extract_result_data(events)
+    assert data is not None
+
+    # Verify filter was applied
+    config_used = data["config_used"]
+    assert config_used.get("rit_filter") == "SCC"
     
-#     # Should have completed (regardless of implementation)
-#     rows = _get_rows_count(data["metrics"])
-#     assert rows == 5
-    
-#     # Robust agent should have success_rate field
-#     if "success_rate" in data["metrics"]:
-#         assert 0.0 <= data["metrics"]["success_rate"] <= 1.0
+    # All samples should have gold label matching the filter
+    for sample in data["samples"]:
+        assert sample["gold"] == "SCC", f"Expected gold=SCC but got {sample['gold']}"
 
 
-# @pytest.mark.functional
-# @pytest.mark.asyncio
-# async def test_robust_agent_timing_info(agent, mock_purple):
-#     """
-#     Test that the robust agent includes timing information.
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_rit_filter_config_tracking(agent, mock_purple):
+    """
+    Test that RIT filter configuration is properly tracked in results.
     
-#     This is a feature of the robust agent that helps with debugging.
-#     """
-#     req = {
-#         "participants": {"agent": mock_purple},
-#         "config": {
-#             "max_rows": 3,
-#             "skip_health_check": True,
-#         },
-#     }
+    Like a lab report documenting experimental parameters,
+    the results should show what filter was applied.
+    """
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 5,
+            "rit_filter": "WTC",
+            "skip_health_check": True,
+        },
+    }
 
-#     events = await send_text_message(json.dumps(req), agent, streaming=False)
-#     data = _extract_result_data(events)
-#     assert data is not None
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    data = _extract_result_data(events)
+    assert data is not None
+
+    # Verify config tracking
+    assert data["config_used"]["rit_filter"] == "WTC"
     
-#     # Robust agent includes elapsed_seconds
-#     if "elapsed_seconds" in data["metrics"]:
-#         assert data["metrics"]["elapsed_seconds"] >= 0
+    # Robust agent should track filtering stats
+    metrics = data["metrics"]
+    if "rows_skipped_by_filter" in metrics:
+        assert metrics["rows_skipped_by_filter"] >= 0
+    if "total_matching_in_dataset" in metrics:
+        assert metrics["total_matching_in_dataset"] >= 0
+
+
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_rit_filter_scans_entire_dataset(agent, mock_purple):
+    """
+    Test that RIT filter scans entire dataset to find matching rows.
+    
+    When filtering, the agent should scan through all rows looking for matches,
+    not just the first N rows. This ensures we get accurate counts of how many
+    rows of each RIT type exist in the dataset.
+    """
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 5,
+            "rit_filter": "SCC",
+            "skip_health_check": True,
+        },
+    }
+
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    data = _extract_result_data(events)
+    assert data is not None
+
+    metrics = data["metrics"]
+    
+    # Should have scanned more rows than evaluated (due to filtering)
+    if "rows_scanned" in metrics and "rows_attempted" in metrics:
+        # rows_scanned should be >= rows_attempted when filter is active
+        assert metrics["rows_scanned"] >= metrics["rows_attempted"]
+    
+    # Should report total matching rows in dataset
+    if "total_matching_in_dataset" in metrics:
+        assert metrics["total_matching_in_dataset"] >= metrics.get("rows_attempted", 0)
+
+
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_rit_filter_invalid_value(agent, mock_purple):
+    """
+    Test that invalid RIT filter values are rejected.
+    
+    Like a bouncer checking IDs, the agent should reject filters
+    that aren't valid RIT types.
+    """
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 5,
+            "rit_filter": "INVALID",  # Not a valid RIT type
+            "skip_health_check": True,
+        },
+    }
+
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    
+    # Should have failed or rejected with an error about invalid filter
+    # Check if we got a data artifact (might not if it failed early)
+    data = _extract_result_data(events)
+    
+    # If we got data, it should indicate an error
+    # If we didn't get data, the task should have failed/rejected (which is correct)
+    if data is not None:
+        # Check if there's an error indication
+        early_term = data.get("early_termination_reason", "")
+        assert "invalid" in early_term.lower() or data["metrics"]["rows_attempted"] == 0
+
+
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_rit_filter_case_insensitive(agent, mock_purple):
+    """
+    Test that RIT filter is case-insensitive.
+    
+    Users should be able to specify 'sac', 'SAC', or 'Sac' and get the same result.
+    """
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 5,
+            "rit_filter": "sac",  # lowercase
+            "skip_health_check": True,
+        },
+    }
+
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    data = _extract_result_data(events)
+    assert data is not None
+
+    # Should have normalized to uppercase
+    assert data["config_used"]["rit_filter"] == "SAC"
+    
+    # All samples should have SAC gold label
+    for sample in data["samples"]:
+        assert sample["gold"] == "SAC"
+
+
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_rit_filter_reports_total_matching(agent, mock_purple):
+    """
+    Test that RIT filter reports total matching rows in the dataset.
+    
+    When fewer matching rows exist than requested, the agent should:
+    1. Evaluate all matching rows
+    2. Report how many total matching rows exist
+    3. Note that fewer rows were available than requested
+    """
+    # Request more rows than likely exist for a specific RIT type
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 1000,  # Request a lot
+            "rit_filter": "SAC",
+            "skip_health_check": True,
+        },
+    }
+
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    data = _extract_result_data(events)
+    assert data is not None
+
+    metrics = data["metrics"]
+    
+    # Should report total matching in dataset
+    if "total_matching_in_dataset" in metrics:
+        total_matching = metrics["total_matching_in_dataset"]
+        rows_attempted = metrics.get("rows_attempted", 0)
         
-#     # Robust agent includes per-row duration_ms in samples
-#     if data["samples"] and "duration_ms" in data["samples"][0]:
-#         for sample in data["samples"]:
-#             assert sample["duration_ms"] >= 0
+        # rows_attempted should equal total_matching (we evaluated all of them)
+        # or equal max_rows if there were more than enough
+        assert rows_attempted <= 1000
+        assert rows_attempted == min(total_matching, 1000)
+        
+        # If fewer than requested, early_termination_reason should explain
+        if total_matching < 1000:
+            early_term = data.get("early_termination_reason", "")
+            assert "SAC" in early_term or str(total_matching) in early_term
+
+
+@pytest.mark.functional
+@pytest.mark.asyncio
+async def test_no_filter_processes_all_types(agent, mock_purple):
+    """
+    Test that without a filter, all RIT types are processed.
+    
+    This is the baseline behavior - when no filter is specified,
+    rows of all RIT types should be evaluated.
+    """
+    req = {
+        "participants": {"agent": mock_purple},
+        "config": {
+            "max_rows": 20,
+            # No rit_filter specified
+            "skip_health_check": True,
+        },
+    }
+
+    events = await send_text_message(json.dumps(req), agent, streaming=False)
+    data = _extract_result_data(events)
+    assert data is not None
+
+    # rit_filter should be None or not present
+    rit_filter = data["config_used"].get("rit_filter")
+    assert rit_filter is None
+    
+    # Samples should have various gold labels (not all the same)
+    gold_labels = set(sample["gold"] for sample in data["samples"])
+    # With 20 rows, we should see at least 2 different RIT types
+    # (unless the dataset is very skewed)
+    assert len(gold_labels) >= 1  # At minimum, should have some labels

@@ -45,7 +45,7 @@ def _wait_for_server(url: str, timeout_s: float = 30.0) -> bool:
     return False
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")   # Changed from session to function, so every test gets its own server instance (mimic how it should work in agentbeats scenario)
 def agent(request):
     """
     Agent URL fixture. 

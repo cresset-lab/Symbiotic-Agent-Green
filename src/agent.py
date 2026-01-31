@@ -70,6 +70,11 @@ class AssessmentState:
     total_failures: int = 0
     circuit_broken: bool = False
     
+    # Filtering state
+    rows_skipped_by_filter: int = 0
+    rows_scanned: int = 0  # Total rows looked at (including filtered)
+    total_matching_in_dataset: int = 0  # Total rows matching filter in entire dataset
+    
     # Timing
     start_time: float = field(default_factory=time.time)
     
@@ -99,6 +104,10 @@ class AssessmentState:
             self.errors.append(f"Row {result.row_index}: {result.error_message}")
         
         self._add_result(result)
+    
+    def record_filtered(self):
+        """Record a row that was skipped due to RIT filter."""
+        self.rows_skipped_by_filter += 1
     
     def _add_result(self, result: RowResult):
         """Keep results (with a reasonable limit to avoid huge payloads)."""
@@ -147,6 +156,9 @@ class AssessmentState:
             "metrics": {
                 "rows_attempted": self.total_attempted,
                 "rows_successful": self.total_successful,
+                "rows_skipped_by_filter": self.rows_skipped_by_filter,
+                "rows_scanned": self.rows_scanned,
+                "total_matching_in_dataset": self.total_matching_in_dataset,
                 "correct": self.correct,
                 "accuracy": round(self.accuracy, 4),
                 "success_rate": round(self.success_rate, 4),
@@ -279,11 +291,13 @@ class Agent:
         but with a time limit for each attempt.
         """
         gold = ""  # Will be set by caller
+        
+        # A2A payload format
         payload = (
             f"{self.prompt}\n\n"
-            "===== INPUT START =====\n"
+            "===== RULES START =====\n"
             f"{ruleset_text}\n"
-            "===== INPUT END =====\n"
+            "===== RULES END =====\n"
         )
         
         last_error = ""
@@ -358,15 +372,23 @@ class Agent:
         """
         result = state.to_result_dict(config_used, early_termination_reason=reason)
         
+        # Build summary with filter info
+        rit_filter = config_used.get("rit_filter")
+        filter_info = f" [filter: {rit_filter}]" if rit_filter else ""
+        
         summary = (
-            f"{'PARTIAL RESULTS' if is_failure else 'COMPLETED'}: "
+            f"{'PARTIAL RESULTS' if is_failure else 'COMPLETED'}{filter_info}: "
             f"Accuracy {state.accuracy:.2%} ({state.correct}/{state.total_successful}) "
-            f"| {state.total_attempted} rows attempted "
+            f"| {state.total_attempted} rows evaluated "
             f"| {state.total_failures} failures"
         )
         
+        if rit_filter:
+            # Show how many total matching rows exist in the dataset
+            summary += f" | Total {rit_filter} rows in dataset: {state.total_matching_in_dataset}"
+        
         if reason:
-            summary += f" | Stopped: {reason}"
+            summary += f" | Note: {reason}"
         
         print(f"DEBUG: Emitting results - {summary}")
         
@@ -406,6 +428,19 @@ class Agent:
         gold_col = cfg.get("gold_column", "trad_result")
         max_rows = int(cfg.get("max_rows", 50))
         
+        # RIT type filter - only evaluate rows with this specific label
+        # If None or empty, evaluate all RIT types
+        rit_filter = cfg.get("rit_filter", None) or cfg.get("filter_rit", None)
+        if rit_filter:
+            rit_filter = rit_filter.strip().upper()
+            if rit_filter not in ALLOWED_LABELS:
+                await updater.failed(
+                    new_agent_text_message(
+                        f"Invalid rit_filter '{rit_filter}'. Must be one of: {sorted(ALLOWED_LABELS)}"
+                    )
+                )
+                return
+        
         # Robustness config
         row_timeout = int(cfg.get("row_timeout", self.DEFAULT_ROW_TIMEOUT))
         max_retries = int(cfg.get("max_retries", self.DEFAULT_MAX_RETRIES))
@@ -417,6 +452,7 @@ class Agent:
             "ruleset_column": ruleset_col,
             "gold_column": gold_col,
             "max_rows": max_rows,
+            "rit_filter": rit_filter,  # None means all types
             "row_timeout": row_timeout,
             "max_retries": max_retries,
             "circuit_breaker_threshold": circuit_threshold,
@@ -457,6 +493,7 @@ class Agent:
             TaskState.working,
             new_agent_text_message(
                 f"Starting benchmark: {max_rows} rows, {row_timeout}s timeout per row"
+                + (f", filtering for RIT type: {rit_filter}" if rit_filter else ", all RIT types")
             ),
         )
 
@@ -468,8 +505,28 @@ class Agent:
                 reader = csv.DictReader(f)
                 
                 for i, row in enumerate(reader):
-                    if i >= max_rows:
-                        break
+                    # Track total rows scanned
+                    state.rows_scanned = i + 1
+                    
+                    ruleset_text = row.get(ruleset_col, "")
+                    gold = (row.get(gold_col, "") or "").strip().upper()
+                    
+                    # === RIT FILTER CHECK ===
+                    # Skip rows that don't match the filter (if filter is set)
+                    if rit_filter:
+                        if gold == rit_filter:
+                            state.total_matching_in_dataset += 1
+                        else:
+                            state.record_filtered()
+                            continue
+                    
+                    # Check if we've processed enough matching rows
+                    if state.total_attempted >= max_rows:
+                        # If filtering, keep scanning to count total matching rows
+                        if rit_filter:
+                            continue  # Keep counting but don't process
+                        else:
+                            break  # No filter, just stop
                     
                     # === CIRCUIT BREAKER CHECK ===
                     if state.consecutive_failures >= circuit_threshold:
@@ -479,10 +536,11 @@ class Agent:
                         )
                         state.circuit_broken = True
                         print(f"DEBUG: {termination_reason}")
-                        break
-                    
-                    ruleset_text = row.get(ruleset_col, "")
-                    gold = (row.get(gold_col, "") or "").strip().upper()
+                        # If filtering, keep scanning to count total
+                        if rit_filter:
+                            continue
+                        else:
+                            break
                     
                     # === PROCESS SINGLE ROW (with retries) ===
                     result = await self._ask_purple_with_retry(
@@ -505,12 +563,14 @@ class Agent:
                     
                     # Progress update every 5 rows
                     if state.total_attempted % 5 == 0:
+                        filter_info = f" (filter: {rit_filter})" if rit_filter else ""
                         await updater.update_status(
                             TaskState.working,
                             new_agent_text_message(
-                                f"Progress: {state.total_attempted}/{max_rows} rows "
+                                f"Progress: {state.total_attempted}/{max_rows} rows{filter_info} "
                                 f"| Accuracy: {state.accuracy:.1%} "
                                 f"| Failures: {state.total_failures}"
+                                + (f" | Skipped: {state.rows_skipped_by_filter}" if rit_filter else "")
                             ),
                         )
         
@@ -521,19 +581,39 @@ class Agent:
             import traceback
             traceback.print_exc()
         
+        # Check if filter resulted in fewer rows than requested
+        if rit_filter:
+            if state.total_attempted == 0 and state.total_matching_in_dataset == 0:
+                termination_reason = (
+                    f"No rows found with RIT type '{rit_filter}' in dataset "
+                    f"({state.rows_scanned} rows scanned, all had different RIT types)"
+                )
+            elif state.total_attempted < max_rows:
+                # We found some but not enough - this is informational, not an error
+                if not termination_reason:  # Don't override error messages
+                    termination_reason = (
+                        f"Dataset contains only {state.total_matching_in_dataset} rows "
+                        f"with RIT type '{rit_filter}' (requested {max_rows})"
+                    )
+        
         # === ALWAYS EMIT RESULTS ===
-        is_failure = bool(termination_reason) or state.circuit_broken
+        # Determine if this is actually a failure or just informational
+        # "Fewer matching rows than requested" is informational, not a failure
+        is_actual_failure = state.circuit_broken or (
+            termination_reason and 
+            "Unexpected error" in termination_reason
+        )
         
         await self._emit_partial_results(
             updater=updater,
             state=state,
             config_used=config_used,
             reason=termination_reason,
-            is_failure=is_failure,
+            is_failure=is_actual_failure,
         )
         
         # Set final status
-        if is_failure:
+        if is_actual_failure:
             # Even on "failure", we completed with partial results
             # Use 'completed' if we have meaningful results, 'failed' only if we got nothing
             if state.total_successful > 0:
