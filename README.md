@@ -98,6 +98,15 @@ Green expects:
   "config": { }
 }
 ```
+### To use scenario.toml in the benchmark repo
+
+[green_agent]
+agentbeats_id = "019c178a-0f6f-7852-9fc8-f2aa84ebdf56"
+env = {}
+[config]
+# Add your assessment config under [config]
+max_rows = 30
+rit_filter = "STC"
 
 ### `participants` (required)
 
