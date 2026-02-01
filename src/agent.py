@@ -29,7 +29,7 @@ ALLOWED_LABELS = {"WAC", "SAC", "WTC", "STC", "WCC", "SCC"}
 
 
 class RowStatus(str, Enum):
-    """Status of individual row processing - like a grade for each exam."""
+    """Status of individual row processing."""
     SUCCESS = "success"
     TIMEOUT = "timeout"
     ERROR = "error"
@@ -53,9 +53,9 @@ class RowResult:
 @dataclass 
 class AssessmentState:
     """
-    Tracks assessment progress - like a scoreboard that persists even if the game is interrupted.
+    Tracks assessment progress. Persists state even if execution is interrupted.
     
-    Key insight: We always have SOME results to report, even if we fail partway through.
+    Ensures results can be reported even if the process fails partway through.
     """
     total_attempted: int = 0
     total_successful: int = 0
@@ -79,7 +79,7 @@ class AssessmentState:
     start_time: float = field(default_factory=time.time)
     
     def record_success(self, result: RowResult):
-        """Record a successful row - like marking an exam as graded."""
+        """Record a successful row."""
         self.total_attempted += 1
         self.total_successful += 1
         self.consecutive_failures = 0  # Reset streak on success
@@ -95,7 +95,7 @@ class AssessmentState:
         self._add_result(result)
     
     def record_failure(self, result: RowResult):
-        """Record a failed row - but don't lose it!"""
+        """Record a failed row."""
         self.total_attempted += 1
         self.consecutive_failures += 1
         self.total_failures += 1
@@ -110,7 +110,7 @@ class AssessmentState:
         self.rows_skipped_by_filter += 1
     
     def _add_result(self, result: RowResult):
-        """Keep results (with a reasonable limit to avoid huge payloads)."""
+        """Keep results (with a limit to avoid large payloads)."""
         if len(self.row_results) < 100:  # Keep first 100 for debugging
             self.row_results.append(result)
     
@@ -123,7 +123,7 @@ class AssessmentState:
     
     @property
     def success_rate(self) -> float:
-        """What percentage of API calls succeeded."""
+        """Percentage of API calls that succeeded."""
         if self.total_attempted == 0:
             return 0.0
         return self.total_successful / self.total_attempted
@@ -134,9 +134,9 @@ class AssessmentState:
     
     def to_result_dict(self, config_used: dict, early_termination_reason: str = "") -> dict:
         """
-        Convert to final result - THIS ALWAYS PRODUCES VALID OUTPUT.
+        Convert to final result.
         
-        Even if we processed 0 rows, we return a valid structure.
+        Returns a valid structure even if 0 rows were processed.
         """
         sample_results = [
             {
@@ -212,19 +212,19 @@ class Agent:
     """
     Green agent for RIT classification benchmark.
     
-    Robustness features (think of it like a well-designed assembly line):
+    Robustness features:
     1. Health check - verify purple agent is alive before starting
-    2. Per-row timeout - don't let one slow response block everything
-    3. Retry logic - transient failures get a second chance
-    4. Circuit breaker - stop early if purple agent is clearly dead
-    5. Partial results - ALWAYS return what we have, even on failure
+    2. Per-row timeout - prevent slow responses from blocking execution
+    3. Retry logic - transient failures are retried
+    4. Circuit breaker - stop early if purple agent is unresponsive
+    5. Partial results - return available results even on failure
     """
     
     required_roles: list[str] = ["agent"]
     required_config_keys: list[str] = []
     
     # Robustness defaults (can be overridden via config)
-    DEFAULT_ROW_TIMEOUT = 60  # seconds per purple agent call
+    DEFAULT_ROW_TIMEOUT = 200  # seconds per purple agent call
     DEFAULT_MAX_RETRIES = 2  # retry failed calls this many times
     DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 5  # consecutive failures before stopping
     DEFAULT_HEALTH_CHECK_TIMEOUT = 10  # seconds to verify purple is alive
@@ -256,8 +256,6 @@ class Agent:
     async def _health_check(self, purple_url: str, timeout: int) -> tuple[bool, str]:
         """
         Verify purple agent is alive before starting the benchmark.
-        
-        Like checking if a student is present before handing them an exam.
         """
         try:
             # Send a simple ping message
@@ -286,9 +284,6 @@ class Agent:
     ) -> RowResult:
         """
         Ask purple agent with timeout and retry logic.
-        
-        Like a teacher giving a student multiple chances to answer,
-        but with a time limit for each attempt.
         """
         gold = ""  # Will be set by caller
         
@@ -318,7 +313,7 @@ class Agent:
                 duration_ms = int((time.time() - start_time) * 1000)
                 pred = _extract_label(response)
                 
-                # Success! (even if we couldn't parse a label)
+                # Success (even if label parsing failed)
                 status = RowStatus.SUCCESS if pred else RowStatus.PARSE_FAILED
                 
                 return RowResult(
@@ -366,9 +361,9 @@ class Agent:
         is_failure: bool = True,
     ):
         """
-        Emit results even on failure - the show must go on!
+        Emit results even on failure.
         
-        This ensures we NEVER lose completed work.
+        Ensures completed work is preserved.
         """
         result = state.to_result_dict(config_used, early_termination_reason=reason)
         
@@ -520,7 +515,7 @@ class Agent:
                             state.record_filtered()
                             continue
                     
-                    # Check if we've processed enough matching rows
+                    # Check if enough matching rows have been processed
                     if state.total_attempted >= max_rows:
                         # If filtering, keep scanning to count total matching rows
                         if rit_filter:
@@ -555,7 +550,7 @@ class Agent:
                     result.gold = gold
                     result.is_correct = (result.pred == gold) if result.pred else False
                     
-                    # Record result (success or failure - we keep everything!)
+                    # Record result (success or failure)
                     if result.status in (RowStatus.SUCCESS, RowStatus.PARSE_FAILED):
                         state.record_success(result)
                     else:
@@ -575,7 +570,7 @@ class Agent:
                         )
         
         except Exception as e:
-            # Unexpected error - but we STILL emit partial results!
+            # Unexpected error - partial results are still emitted
             termination_reason = f"Unexpected error: {type(e).__name__}: {e}"
             print(f"DEBUG: {termination_reason}")
             import traceback
@@ -589,7 +584,7 @@ class Agent:
                     f"({state.rows_scanned} rows scanned, all had different RIT types)"
                 )
             elif state.total_attempted < max_rows:
-                # We found some but not enough - this is informational, not an error
+                # Found some but not enough - this is informational, not an error
                 if not termination_reason:  # Don't override error messages
                     termination_reason = (
                         f"Dataset contains only {state.total_matching_in_dataset} rows "
@@ -614,8 +609,8 @@ class Agent:
         
         # Set final status
         if is_actual_failure:
-            # Even on "failure", we completed with partial results
-            # Use 'completed' if we have meaningful results, 'failed' only if we got nothing
+            # Even on "failure", completion occurred with partial results
+            # Use 'completed' if meaningful results exist, 'failed' only if nothing was processed
             if state.total_successful > 0:
                 await updater.update_status(
                     TaskState.completed,
