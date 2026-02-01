@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # A2A Agent Template
 
 A minimal template for building [A2A (Agent-to-Agent)](https://a2a-protocol.org/latest/) green agents compatible with the [AgentBeats](https://agentbeats.dev) platform.
@@ -85,3 +86,9 @@ ghcr.io/<your-username>/<your-repo-name>:1
 Once the workflow completes, find your Docker image in the Packages section (right sidebar of your repository). Configure the package visibility in package settings.
 
 > **Note:** Organization repositories may need package write permissions enabled manually (Settings → Actions → General). Version tags must follow [semantic versioning](https://semver.org/) (e.g., `v1.0.0`).
+=======
+# Symbiotic-Agent
+Project Name: Symbiotic Agent (A Hybrid Symbolic-LLM Agent for IoT Rule Validation)
+
+Description: We present the Symbiotic Agent, a novel hybrid architecture for the Rule Interaction Threat (RIT) validation task. Unlike pure LLM agents, it integrates a deterministic symbolic analysis layer (for guaranteed logical coverage) with a contextual LLM adjudication layer (for semantic reasoning). This symbiosis allows it to achieve state-of-the-art precision and robustness, demonstrating a scalable blueprint for reliable AI agents in safety-critical domains.
+>>>>>>> 8d2ce6301e4feae59ded8af536ccf2200e266da0
